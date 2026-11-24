@@ -256,12 +256,12 @@ class Widget:
     def panel(self, x, y, w, h, title):
         p = self.palette()
         self.canvas.create_rectangle(x, y, x+w, y+h, fill=p["panel"],
-            outline=p["edge"], width=1)
+            outline=p["edge"], width=1, tags="panel_bg")
         self.text(x+11, y+7, title, 7, MUTED, "bold")
 
     def header(self, subtitle):
         p = self.palette()
-        self.canvas.create_rectangle(1, 1, W-1, 49, fill=p["header"], outline="")
+        self.canvas.create_rectangle(1, 1, W-1, 49, fill=p["header"], outline="", tags="header_bg")
         self.canvas.create_line(8, 48, W-8, 48, fill=p["edge"])
         self.text(14, 7, "AERO PC MONITOR", 11, TEXT, "bold")
         self.text(14, 28, subtitle, 6, MUTED)
@@ -341,7 +341,7 @@ class Widget:
         p = self.palette()
         self.header("НАСТРОЙКИ ОФОРМЛЕНИЯ")
         self.panel(12, 60, 346, 94, "ПРОЗРАЧНОСТЬ ОКНА")
-        self.alpha_value = self.text(337, 81, f"{int(self.alpha*100)}%", 9, p["accent"], "bold", anchor="ne")
+        self.alpha_value = self.text(337, 81, f"{int(self.alpha*100)}%", 9, p["accent"], "bold", anchor="ne", tags="alpha_value")
         self.alpha_scale = tk.Scale(self.root, from_=55, to=98, orient="horizontal",
             showvalue=False, resolution=1, length=310, sliderlength=18,
             highlightthickness=0, bd=0, troughcolor=p["track"],
@@ -351,7 +351,7 @@ class Widget:
         self.canvas.create_window(185, 119, window=self.alpha_scale, width=316, height=34)
 
         self.panel(12, 166, 346, 100, "ЦВЕТ ОФОРМЛЕНИЯ")
-        self.hue_value = self.text(337, 187, f"{int(self.hue*360)}°", 9, p["accent"], "bold", anchor="ne")
+        self.hue_value = self.text(337, 187, f"{int(self.hue*360)}°", 9, p["accent"], "bold", anchor="ne", tags="hue_value")
         self.hue_scale = tk.Scale(self.root, from_=0, to=359, orient="horizontal",
             showvalue=False, resolution=1, length=310, sliderlength=18,
             highlightthickness=0, bd=0, troughcolor=p["track"],
@@ -387,8 +387,9 @@ class Widget:
         p = self.palette()
         self.root.configure(bg=p["bg"])
         self.canvas.configure(bg=p["bg"], highlightbackground=p["edge"])
-        self.canvas.itemconfigure("all", fill=TEXT)
-        # Update main surfaces and accents without rebuilding the active slider widgets.
+        # Update the complete palette without rebuilding the active slider widgets.
+        self.canvas.itemconfigure("panel_bg", fill=p["panel"], outline=p["edge"])
+        self.canvas.itemconfigure("header_bg", fill=p["header"])
         for item in self.canvas.find_all():
             tags = self.canvas.gettags(item)
             if "cancel_btn" in tags:
