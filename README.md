@@ -1,5 +1,19 @@
-# PC Monitor Widget
+# Aero Monitor — PC Monitor Widget
 
-Windows desktop widget for monitoring CPU, GPU, RAM, disks, Wi-Fi and Ethernet.
+Компактный полупрозрачный виджет для Windows 10/11 в стиле Aero Glass.
 
-The project source and Windows build workflow will be added here.
+## Что показывает
+- CPU: загрузка и температура (если датчик доступен).
+- GPU: загрузка и температура (если датчик доступен).
+- RAM: занято / всего и индикатор.
+- Диски: заполненность системных накопителей.
+- Сеть: имя Wi-Fi (SSID) или Ethernet, локальный IPv4, скорость приёма и передачи.
+
+## Управление
+- Перетаскивание — за верхнюю панель.
+- Кнопка «–» — свернуть.
+- Кнопка «×» — закрыть.
+- Виджет закреплён поверх окон.
+
+## Сборка
+GitHub Actions автоматически собирает автономный Windows x64 EXE при каждом push в main.
