@@ -1,220 +1,339 @@
 using System.Diagnostics;
+using System.Drawing.Drawing2D;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using LibreHardwareMonitor.Hardware;
 
 namespace PCMonitorWidget;
 
 public sealed class MainForm : Form
 {
-    private readonly Label cpuLabel = MakeValue();
-    private readonly Label gpuLabel = MakeValue();
-    private readonly Label ramLabel = MakeValue();
-    private readonly Label diskLabel = MakeValue();
-    private readonly Label wifiLabel = MakeValue();
-    private readonly Label netLabel = MakeValue();
-    private readonly System.Windows.Forms.Timer timer = new() { Interval = 1500 };
+    private readonly System.Windows.Forms.Timer timer = new() { Interval = 1200 };
     private readonly Computer computer = new()
     {
-        IsCpuEnabled = true,
-        IsGpuEnabled = true,
-        IsMemoryEnabled = true,
-        IsStorageEnabled = true
+        IsCpuEnabled = true, IsGpuEnabled = true,
+        IsMemoryEnabled = true, IsStorageEnabled = true
     };
-    private readonly PerformanceCounter? cpuCounter;
-    private long previousReceived;
-    private long previousSent;
-    private DateTime previousNetworkTime = DateTime.UtcNow;
+    private PerformanceCounter? cpuCounter;
+    private float cpuLoad, gpuLoad;
+    private float? cpuTemp, gpuTemp;
+    private double ramUsed, ramTotal;
+    private string gpuName = "Видеокарта";
+    private string wifiName = "Поиск сети…";
+    private string ipAddress = "";
+    private string diskInfo = "Проверка дисков…";
+    private double downSpeed, upSpeed;
+    private long oldReceived, oldSent;
+    private DateTime oldNetworkTime = DateTime.UtcNow;
+    private bool firstNetworkSample = true;
+    private Rectangle closeRect, minimizeRect;
+    private const int DWMWA_SYSTEMBACKDROP_TYPE = 38;
+    private const int DWMSBT_TRANSIENTWINDOW = 3;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MEMORYSTATUSEX
+    {
+        public uint dwLength, dwMemoryLoad;
+        public ulong ullTotalPhys, ullAvailPhys, ullTotalPageFile, ullAvailPageFile,
+            ullTotalVirtual, ullAvailVirtual, ullAvailExtendedVirtual;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmExtendFrameIntoClientArea(IntPtr hwnd, ref MARGINS margins);
+    [DllImport("user32.dll")]
+    private static extern bool ReleaseCapture();
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MARGINS { public int left, right, top, bottom; }
 
     public MainForm()
     {
-        Text = "PC Monitor Widget";
-        Width = 390;
-        Height = 540;
-        MinimumSize = new Size(340, 430);
-        BackColor = Color.FromArgb(19, 22, 29);
-        ForeColor = Color.White;
-        Font = new Font("Segoe UI", 10);
-        FormBorderStyle = FormBorderStyle.SizableToolWindow;
-        TopMost = false;
+        Text = "Aero Monitor";
+        ClientSize = new Size(326, 438);
+        MinimumSize = MaximumSize = Size;
+        FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.CenterScreen;
-
-        var header = new Label
-        {
-            Text = "PC MONITOR",
-            Dock = DockStyle.Top,
-            Height = 48,
-            TextAlign = ContentAlignment.MiddleCenter,
-            Font = new Font("Segoe UI Semibold", 15),
-            ForeColor = Color.FromArgb(90, 190, 255)
-        };
-        Controls.Add(header);
-
-        var grid = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            Padding = new Padding(12),
-            ColumnCount = 2,
-            RowCount = 3,
-            BackColor = BackColor
-        };
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        for (int i = 0; i < 3; i++) grid.RowStyles.Add(new RowStyle(SizeType.Percent, 33.33f));
-        AddTile(grid, "ПРОЦЕССОР", cpuLabel, 0, 0);
-        AddTile(grid, "ВИДЕОКАРТА", gpuLabel, 1, 0);
-        AddTile(grid, "ОПЕРАТИВНАЯ ПАМЯТЬ", ramLabel, 0, 1);
-        AddTile(grid, "ДИСКИ", diskLabel, 1, 1);
-        AddTile(grid, "WI-FI / ETHERNET", wifiLabel, 0, 2);
-        AddTile(grid, "СЕТЕВОЙ ТРАФИК", netLabel, 1, 2);
-        Controls.Add(grid);
-        Controls.SetChildIndex(header, 0);
+        ShowInTaskbar = true;
+        TopMost = true;
+        DoubleBuffered = true;
+        BackColor = Color.FromArgb(18, 28, 42);
+        ForeColor = Color.White;
+        Font = new Font("Segoe UI", 9f);
+        Opacity = 0.96;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        Region = new Region(RoundedRect(new Rectangle(0, 0, Width, Height), 18));
 
         try { computer.Open(); } catch { }
-        try { cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total"); cpuCounter.NextValue(); } catch { }
-        timer.Tick += (_, _) => RefreshStats();
+        try
+        {
+            cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
+            cpuCounter.NextValue();
+        }
+        catch { }
+
+        timer.Tick += (_, _) => { ReadSensors(); Invalidate(); };
         timer.Start();
-        RefreshStats();
+        ReadSensors();
     }
 
-    private static Label MakeValue() => new()
+    protected override void OnHandleCreated(EventArgs e)
     {
-        Dock = DockStyle.Fill,
-        ForeColor = Color.White,
-        Font = new Font("Segoe UI Semibold", 12),
-        TextAlign = ContentAlignment.MiddleCenter,
-        AutoEllipsis = true
-    };
-
-    private static void AddTile(TableLayoutPanel grid, string title, Label value, int col, int row)
-    {
-        var panel = new Panel
+        base.OnHandleCreated(e);
+        try
         {
-            Dock = DockStyle.Fill,
-            BackColor = Color.FromArgb(31, 37, 48),
-            Margin = new Padding(6),
-            Padding = new Padding(7)
-        };
-        var caption = new Label
-        {
-            Text = title,
-            Dock = DockStyle.Top,
-            Height = 28,
-            ForeColor = Color.FromArgb(150, 165, 185),
-            Font = new Font("Segoe UI Semibold", 8),
-            TextAlign = ContentAlignment.MiddleCenter
-        };
-        panel.Controls.Add(value);
-        panel.Controls.Add(caption);
-        grid.Controls.Add(panel, col, row);
+            int backdrop = DWMSBT_TRANSIENTWINDOW;
+            DwmSetWindowAttribute(Handle, DWMWA_SYSTEMBACKDROP_TYPE, ref backdrop, sizeof(int));
+            var margins = new MARGINS { left = -1, right = -1, top = -1, bottom = -1 };
+            DwmExtendFrameIntoClientArea(Handle, ref margins);
+        }
+        catch { }
     }
 
-    private void RefreshStats()
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left) return;
+        if (closeRect.Contains(e.Location)) { Close(); return; }
+        if (minimizeRect.Contains(e.Location)) { WindowState = FormWindowState.Minimized; return; }
+        if (e.Y < 48)
+        {
+            ReleaseCapture();
+            SendMessage(Handle, 0xA1, (IntPtr)2, IntPtr.Zero);
+        }
+    }
+
+    private void ReadSensors()
     {
         try
         {
-            float? cpuTemp = null, gpuTemp = null, gpuLoad = null;
+            cpuTemp = null; gpuTemp = null; gpuLoad = 0;
             foreach (var hw in computer.Hardware)
             {
                 UpdateHardware(hw);
-                foreach (var sensor in hw.Sensors)
-                {
-                    if (hw.HardwareType == HardwareType.Cpu && sensor.SensorType == SensorType.Temperature && sensor.Value.HasValue)
-                        cpuTemp ??= sensor.Value.Value;
-                    if ((hw.HardwareType == HardwareType.GpuAmd || hw.HardwareType == HardwareType.GpuNvidia || hw.HardwareType == HardwareType.GpuIntel) && sensor.Value.HasValue)
-                    {
-                        if (sensor.SensorType == SensorType.Temperature) gpuTemp ??= sensor.Value.Value;
-                        if (sensor.SensorType == SensorType.Load) gpuLoad ??= sensor.Value.Value;
-                    }
-                }
+                ReadHardware(hw);
             }
-
-            float cpuLoad = 0;
-            try { cpuLoad = cpuCounter?.NextValue() ?? 0; } catch { }
-            cpuLabel.Text = $"Загрузка: {cpuLoad:0}%\nТемпература: {(cpuTemp.HasValue ? $"{cpuTemp:0} °C" : "нет датчика")}";
-            gpuLabel.Text = $"Загрузка: {(gpuLoad.HasValue ? $"{gpuLoad:0}%" : "—")}\nТемпература: {(gpuTemp.HasValue ? $"{gpuTemp:0} °C" : "нет датчика")}";
-
-            var mem = GC.GetGCMemoryInfo();
-            var totalRam = GetTotalPhysicalMemory();
-            var usedRam = totalRam > 0 ? totalRam - GetAvailablePhysicalMemory() : 0;
-            ramLabel.Text = totalRam > 0 ? $"{usedRam / 1073741824d:0.0} / {totalRam / 1073741824d:0.0} ГБ" : "Недоступно";
-
-            var drives = DriveInfo.GetDrives().Where(d => d.IsReady && d.DriveType == DriveType.Fixed)
-                .Take(3).Select(d => $"{d.Name.TrimEnd('\\')}  {100d * (d.TotalSize - d.AvailableFreeSpace) / d.TotalSize:0}%");
-            diskLabel.Text = string.Join("\n", drives);
-            if (string.IsNullOrWhiteSpace(diskLabel.Text)) diskLabel.Text = "Нет данных";
-
-            wifiLabel.Text = GetNetworkStatus();
-            netLabel.Text = GetNetworkSpeed();
+            try { cpuLoad = Math.Clamp(cpuCounter?.NextValue() ?? 0, 0, 100); } catch { cpuLoad = 0; }
+            ReadMemory();
+            ReadDisks();
+            ReadNetwork();
         }
-        catch (Exception ex)
-        {
-            Text = "PC Monitor Widget — " + ex.Message;
-        }
+        catch { }
     }
 
-    private static void UpdateHardware(IHardware hardware)
+    private void ReadHardware(IHardware hw)
     {
-        hardware.Update();
-        foreach (var sub in hardware.SubHardware) UpdateHardware(sub);
+        if (hw.HardwareType == HardwareType.Cpu)
+            foreach (var s in hw.Sensors)
+                if (s.SensorType == SensorType.Temperature && s.Value.HasValue) cpuTemp ??= s.Value.Value;
+
+        if (hw.HardwareType is HardwareType.GpuAmd or HardwareType.GpuNvidia or HardwareType.GpuIntel)
+        {
+            gpuName = hw.Name;
+            foreach (var s in hw.Sensors)
+            {
+                if (s.SensorType == SensorType.Temperature && s.Value.HasValue) gpuTemp ??= s.Value.Value;
+                if (s.SensorType == SensorType.Load && s.Value.HasValue) gpuLoad = Math.Max(gpuLoad, s.Value.Value);
+            }
+        }
+        foreach (var sub in hw.SubHardware) ReadHardware(sub);
     }
 
-    private static string GetNetworkStatus()
+    private static void UpdateHardware(IHardware hw) => hw.Update();
+
+    private void ReadMemory()
+    {
+        var m = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
+        if (GlobalMemoryStatusEx(ref m))
+        {
+            ramTotal = m.ullTotalPhys / 1073741824d;
+            ramUsed = (m.ullTotalPhys - m.ullAvailPhys) / 1073741824d;
+        }
+    }
+
+    private void ReadDisks()
+    {
+        var drives = DriveInfo.GetDrives().Where(d => d.IsReady && d.DriveType == DriveType.Fixed).Take(2).ToArray();
+        diskInfo = drives.Length == 0 ? "Диски не найдены" :
+            string.Join("     ", drives.Select(d =>
+                $"{d.Name.TrimEnd('\\')}  {100d * (d.TotalSize - d.AvailableFreeSpace) / d.TotalSize:0}%"));
+    }
+
+    private void ReadNetwork()
     {
         var active = NetworkInterface.GetAllNetworkInterfaces()
             .Where(n => n.OperationalStatus == OperationalStatus.Up &&
-                n.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
-                n.NetworkInterfaceType != NetworkInterfaceType.Tunnel).ToArray();
-        string ssid = RunCommand("netsh", "wlan show interfaces");
-        var nameLine = ssid.Split('\n').FirstOrDefault(x => x.TrimStart().StartsWith("SSID", StringComparison.OrdinalIgnoreCase) && !x.TrimStart().StartsWith("BSSID", StringComparison.OrdinalIgnoreCase));
-        string wifiName = nameLine?.Split(':').Skip(1).FirstOrDefault()?.Trim() ?? "";
-        string ip = active.SelectMany(n => n.GetIPProperties().UnicastAddresses)
-            .FirstOrDefault(a => a.Address.AddressFamily == AddressFamily.InterNetwork)?.Address.ToString() ?? "IP нет";
-        return $"{(wifiName.Length > 0 ? wifiName : active.Length > 0 ? active[0].Name : "Нет подключения")}\n{ip}";
-    }
+                        n.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
+                        n.NetworkInterfaceType != NetworkInterfaceType.Tunnel).ToArray();
 
-    private string GetNetworkSpeed()
-    {
+        string netsh = RunNetsh();
+        var match = Regex.Match(netsh, @"(?im)^\s*SSID\s*:\s*(.+?)\s*$");
+        wifiName = match.Success ? match.Groups[1].Value.Trim() :
+            active.FirstOrDefault()?.Name ?? "Нет подключения";
+        var ip = active.SelectMany(n => n.GetIPProperties().UnicastAddresses)
+            .FirstOrDefault(a => a.Address.AddressFamily == AddressFamily.InterNetwork);
+        ipAddress = ip?.Address.ToString() ?? "IP не получен";
+
         long received = 0, sent = 0;
-        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces().Where(n => n.OperationalStatus == OperationalStatus.Up))
+        foreach (var nic in active)
         {
-            try { var s = nic.GetIPv4Statistics(); received += s.BytesReceived; sent += s.BytesSent; } catch { }
+            try { var s = nic.GetIPv4Statistics(); received += s.BytesReceived; sent += s.BytesSent; }
+            catch { }
         }
         var now = DateTime.UtcNow;
-        double seconds = Math.Max(0.2, (now - previousNetworkTime).TotalSeconds);
-        double down = Math.Max(0, received - previousReceived) / seconds / 1024;
-        double up = Math.Max(0, sent - previousSent) / seconds / 1024;
-        previousReceived = received; previousSent = sent; previousNetworkTime = now;
-        return $"↓ {down:0.0} КБ/с\n↑ {up:0.0} КБ/с";
+        if (!firstNetworkSample)
+        {
+            double sec = Math.Max(.2, (now - oldNetworkTime).TotalSeconds);
+            downSpeed = Math.Max(0, received - oldReceived) / sec / 1024d;
+            upSpeed = Math.Max(0, sent - oldSent) / sec / 1024d;
+        }
+        firstNetworkSample = false;
+        oldReceived = received; oldSent = sent; oldNetworkTime = now;
     }
 
-    private static string RunCommand(string file, string args)
+    private static string RunNetsh()
     {
         try
         {
-            using var p = Process.Start(new ProcessStartInfo(file, args) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true });
+            using var p = Process.Start(new ProcessStartInfo("netsh", "wlan show interfaces")
+            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true });
             if (p == null) return "";
-            string output = p.StandardOutput.ReadToEnd();
-            p.WaitForExit(1500);
-            return output;
+            string result = p.StandardOutput.ReadToEnd();
+            p.WaitForExit(900);
+            return result;
         }
         catch { return ""; }
     }
 
-    private static ulong GetTotalPhysicalMemory()
+    protected override void OnPaint(PaintEventArgs e)
     {
-        try { return new Microsoft.VisualBasic.Devices.ComputerInfo().TotalPhysicalMemory; } catch { return 0; }
+        base.OnPaint(e);
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+
+        using (var bg = new LinearGradientBrush(ClientRectangle,
+            Color.FromArgb(238, 26, 43, 63), Color.FromArgb(242, 10, 20, 34), 90f))
+            g.FillPath(bg, RoundedRect(new Rectangle(0, 0, Width - 1, Height - 1), 18));
+
+        using (var shine = new LinearGradientBrush(new Rectangle(0, 0, Width, 100),
+            Color.FromArgb(55, 180, 220, 255), Color.FromArgb(0, 100, 160, 220), 90f))
+            g.FillPath(shine, RoundedRect(new Rectangle(1, 1, Width - 2, 100), 17));
+
+        using (var border = new Pen(Color.FromArgb(115, 205, 232, 255), 1f))
+            g.DrawPath(border, RoundedRect(new Rectangle(0, 0, Width - 1, Height - 1), 18));
+
+        DrawText(g, "AERO MONITOR", 18, 13, 10, Color.FromArgb(190, 225, 245), true);
+        DrawText(g, "СИСТЕМА В РЕАЛЬНОМ ВРЕМЕНИ", 18, 29, 7, Color.FromArgb(135, 185, 210), false);
+        closeRect = new Rectangle(294, 12, 18, 18);
+        minimizeRect = new Rectangle(270, 12, 18, 18);
+        DrawWindowButton(g, minimizeRect, "–");
+        DrawWindowButton(g, closeRect, "×");
+
+        DrawMetric(g, 16, 62, 140, 92, "ПРОЦЕССОР", $"{cpuLoad:0}%", cpuTemp, cpuLoad, Color.FromArgb(91, 190, 255));
+        DrawMetric(g, 170, 62, 140, 92, "ВИДЕОКАРТА", $"{gpuLoad:0}%", gpuTemp, gpuLoad, Color.FromArgb(120, 220, 180));
+
+        DrawSection(g, 16, 168, 294, 76, "ОПЕРАТИВНАЯ ПАМЯТЬ");
+        DrawText(g, $"{ramUsed:0.0} ГБ", 29, 190, 21, Color.White, true);
+        DrawText(g, $"из {ramTotal:0.0} ГБ", 113, 198, 10, Color.FromArgb(170, 198, 216), false);
+        DrawBar(g, new Rectangle(29, 225, 267, 6), ramTotal > 0 ? ramUsed / ramTotal * 100 : 0, Color.FromArgb(105, 190, 255));
+
+        DrawSection(g, 16, 254, 294, 48, "НАКОПИТЕЛИ");
+        DrawText(g, diskInfo, 29, 278, 9, Color.FromArgb(224, 237, 247), false);
+
+        DrawSection(g, 16, 312, 294, 106, "СЕТЬ  •  WI-FI / ETHERNET");
+        DrawText(g, ClipText(g, wifiName, 9, 255), 29, 335, 11, Color.White, true);
+        DrawText(g, ipAddress, 29, 354, 8, Color.FromArgb(150, 190, 215), false);
+        DrawText(g, $"↓ {FormatSpeed(downSpeed)}", 29, 378, 10, Color.FromArgb(115, 210, 255), true);
+        DrawText(g, $"↑ {FormatSpeed(upSpeed)}", 166, 378, 10, Color.FromArgb(130, 230, 190), true);
     }
 
-    private static ulong GetAvailablePhysicalMemory()
+    private void DrawMetric(Graphics g, int x, int y, int w, int h, string title,
+        string load, float? temp, float percent, Color accent)
     {
-        try { return new Microsoft.VisualBasic.Devices.ComputerInfo().AvailablePhysicalMemory; } catch { return 0; }
+        DrawSection(g, x, y, w, h, title);
+        DrawText(g, load, x + 12, y + 26, 25, Color.White, true);
+        DrawText(g, "ЗАГРУЗКА", x + 13, y + 57, 7, Color.FromArgb(155, 190, 210), false);
+        DrawText(g, temp.HasValue ? $"{temp.Value:0}°C" : "— °C", x + 76, y + 29, 15, accent, true);
+        DrawText(g, "ТЕМП.", x + 79, y + 57, 7, Color.FromArgb(155, 190, 210), false);
+        DrawBar(g, new Rectangle(x + 12, y + 76, w - 24, 4), percent, accent);
+    }
+
+    private void DrawSection(Graphics g, int x, int y, int w, int h, string title)
+    {
+        var r = new Rectangle(x, y, w, h);
+        using var path = RoundedRect(r, 10);
+        using var fill = new LinearGradientBrush(r, Color.FromArgb(85, 210, 235, 255),
+            Color.FromArgb(36, 105, 145, 180), 90f);
+        g.FillPath(fill, path);
+        using var pen = new Pen(Color.FromArgb(55, 210, 235, 255));
+        g.DrawPath(pen, path);
+        DrawText(g, title, x + 12, y + 8, 7, Color.FromArgb(155, 200, 225), true);
+    }
+
+    private static void DrawBar(Graphics g, Rectangle r, double value, Color color)
+    {
+        using var bg = new SolidBrush(Color.FromArgb(55, 220, 240, 255));
+        using var p = RoundedRect(r, 3);
+        g.FillPath(bg, p);
+        int width = (int)(r.Width * Math.Clamp(value, 0, 100) / 100d);
+        if (width > 2)
+        {
+            using var fg = new SolidBrush(color);
+            g.FillPath(fg, RoundedRect(new Rectangle(r.X, r.Y, width, r.Height), 3));
+        }
+    }
+
+    private static void DrawText(Graphics g, string value, int x, int y, float size, Color color, bool bold)
+    {
+        using var font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Point);
+        using var brush = new SolidBrush(color);
+        g.DrawString(value, font, brush, x, y);
+    }
+
+    private static void DrawWindowButton(Graphics g, Rectangle r, string symbol)
+    {
+        using var b = new SolidBrush(Color.FromArgb(48, 220, 240, 255));
+        g.FillEllipse(b, r);
+        using var f = new Font("Segoe UI", 10, FontStyle.Regular);
+        using var t = new SolidBrush(Color.FromArgb(225, 245, 255));
+        var s = g.MeasureString(symbol, f);
+        g.DrawString(symbol, f, t, r.X + (r.Width - s.Width) / 2, r.Y + (r.Height - s.Height) / 2 - 1);
+    }
+
+    private static string ClipText(Graphics g, string value, float size, int width)
+    {
+        using var f = new Font("Segoe UI", size, FontStyle.Bold);
+        while (value.Length > 4 && g.MeasureString(value, f).Width > width) value = value[..^2] + "…";
+        return value;
+    }
+
+    private static string FormatSpeed(double kb)
+        => kb >= 1024 ? $"{kb / 1024:0.00} МБ/с" : $"{kb:0.0} КБ/с";
+
+    private static GraphicsPath RoundedRect(Rectangle r, int radius)
+    {
+        int d = radius * 2;
+        var p = new GraphicsPath();
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+        return p;
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         timer.Stop();
-        computer.Close();
+        try { computer.Close(); } catch { }
         cpuCounter?.Dispose();
         base.OnFormClosed(e);
     }
