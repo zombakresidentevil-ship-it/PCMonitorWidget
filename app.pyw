@@ -3,9 +3,7 @@
 import ctypes
 import subprocess
 import tkinter as tk
-import tkinter.font as tkfont
 import time
-import shutil
 import psutil
 
 BG = "#101d2d"
@@ -74,6 +72,9 @@ class Widget:
         self.cpu_temp = "—"
         self.gpu_temp = "—"
         self.gpu_value = None
+        self.last_gpu_poll = 0.0
+        self.cached_ssid = 'Поиск сети…'
+        self.last_wifi_poll = 0.0
         self.build()
         self.update()
         self.root.mainloop()
@@ -159,8 +160,9 @@ class Widget:
             self.set_text("ramtotal", f"из {total:.1f} ГБ")
             self.set_bar("rambar", 29, 225, 267, used/total*100 if total else 0, BLUE)
 
-            if int(time.monotonic()) % 4 == 0:
+            if time.monotonic() - self.last_gpu_poll >= 5:
                 self.gpu_value = gpu_load()
+                self.last_gpu_poll = time.monotonic()
             self.set_text("gpuload", f"{self.gpu_value:.0f}%" if self.gpu_value is not None else "—%")
             self.set_bar("gpubar", 182, 138, 116, self.gpu_value or 0, GREEN)
             self.set_text("gputemp", f"{self.gpu_temp}°C")
@@ -175,8 +177,10 @@ class Widget:
                 except Exception: pass
             self.set_text("disk", "     ".join(disks[:2]) or "Диски не найдены")
 
-            ssid = wifi_info()
-            self.set_text("ssid", ssid[:34])
+            if time.monotonic() - self.last_wifi_poll >= 8:
+                self.cached_ssid = wifi_info()
+                self.last_wifi_poll = time.monotonic()
+            self.set_text("ssid", self.cached_ssid[:34])
             addrs = psutil.net_if_addrs()
             ip = next((a.address for values in addrs.values() for a in values
                        if a.family == 2 and not a.address.startswith("127.")), "—")
