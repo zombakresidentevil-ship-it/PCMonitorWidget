@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build lightweight Python EXE
 
 on:
   workflow_dispatch:
@@ -10,15 +10,27 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-python@v5
         with:
-          dotnet-version: 8.0.x
-      - name: Publish
-        run: dotnet publish PCMonitorWidget.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
+          python-version: "3.12"
+      - name: Install small dependencies
+        run: python -m pip install --no-warn-script-location -r requirements.txt pyinstaller==6.11.1
+      - name: Build EXE
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name PCMonitorWidget
+          --exclude-module unittest --exclude-module test
+          --exclude-module tkinter.test
+          app.pyw
+      - name: Report size
+        shell: pwsh
+        run: |
+          $f = Get-Item dist/PCMonitorWidget.exe
+          Write-Host ("EXE size: {0:N2} MB" -f ($f.Length / 1MB))
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: PCMonitorWidget-Windows-x64
-          path: publish/PCMonitorWidget.exe
+          name: PCMonitorWidget-Python-Windows-x64
+          path: dist/PCMonitorWidget.exe
           if-no-files-found: error
           retention-days: 14
