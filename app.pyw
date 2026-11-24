@@ -10,6 +10,7 @@ import time
 import threading
 import tkinter as tk
 import winreg
+import urllib.request
 from pathlib import Path
 
 import psutil
@@ -112,8 +113,41 @@ def gpu_load():
         return None
 
 def temperatures():
-    # Real readings are queried from LibreHardwareMonitor/OpenHardwareMonitor WMI providers.
-    # If no provider is installed/enabled, show unavailable rather than inventing values.
+    # LibreHardwareMonitor 0.9.5+ exposes sensors through its local REST server.
+    # Prefer this API; retain WMI for older LHM and OpenHardwareMonitor releases.
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8085/data.json", timeout=1.5) as response:
+            tree = json.loads(response.read().decode("utf-8", errors="replace"))
+        cpu_values, gpu_values = [], []
+
+        def visit(node, ancestry=()):
+            if not isinstance(node, dict):
+                return
+            label = " ".join(ancestry + (str(node.get("Text", "")),)).lower()
+            if str(node.get("Type", "")).lower() == "temperature":
+                raw_value = node.get("RawValue")
+                if raw_value is None:
+                    raw_value = node.get("Value")
+                try:
+                    value = float(str(raw_value).replace("°c", "").replace(",", ".").strip())
+                    if -10 <= value <= 150:
+                        if any(k in label for k in ("gpu", "radeon", "rx 580", "graphics", "amdgpu")):
+                            gpu_values.append(value)
+                        elif any(k in label for k in ("cpu", "xeon", "processor", "package", "core")):
+                            cpu_values.append(value)
+                except (TypeError, ValueError):
+                    pass
+            for child in node.get("Children", []) or []:
+                visit(child, ancestry + (str(node.get("Text", "")),))
+
+        visit(tree)
+        if cpu_values or gpu_values:
+            return (max(cpu_values) if cpu_values else None,
+                    max(gpu_values) if gpu_values else None)
+    except Exception:
+        pass
+
+    # WMI fallback for older LibreHardwareMonitor and OpenHardwareMonitor.
     script = r"""
 $namespaces = @('root/LibreHardwareMonitor','root/OpenHardwareMonitor')
 foreach ($ns in $namespaces) {
