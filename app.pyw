@@ -124,6 +124,15 @@ foreach ($ns in $namespaces) {
     }
   } catch {}
 }
+try {
+  $thermal = Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop |
+    Select-Object -First 1
+  if ($thermal) {
+    $value = [math]::Round(($thermal.CurrentTemperature / 10) - 273.15, 1)
+    [PSCustomObject]@{ Hardware='CPU ACPI'; Name='Thermal Zone'; Value=$value; Identifier='ACPI' } |
+      ConvertTo-Json -Compress
+  }
+} catch {}
 """
     try:
         raw = subprocess.check_output(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
