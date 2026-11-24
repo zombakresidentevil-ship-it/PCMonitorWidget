@@ -92,18 +92,22 @@ def gpu_load():
             creationflags=0x08000000, text=True, encoding="utf-8",
             errors="replace", stderr=subprocess.DEVNULL, timeout=5)
         rows = list(csv.reader(io.StringIO(raw)))
+        # typeperf emits a metadata row, then a header row with one column per GPU engine.
+        if len(rows) < 3:
+            return None
+        headers = rows[1]
+        sample = rows[-1]
         values = []
-        for row in rows[1:]:
-            if len(row) < 2:
+        for index, header in enumerate(headers):
+            if index == 0 or index >= len(sample):
                 continue
-            counter = row[0].lower()
-            if "engtype_3d" not in counter:
+            if "engtype_3d" not in header.lower():
                 continue
             try:
-                values.append(float(row[-1].strip().replace(",", ".")))
+                values.append(float(sample[index].strip().replace(",", ".")))
             except ValueError:
                 pass
-        return min(100.0, max(values)) if values else None
+        return min(100.0, sum(values)) if values else None
     except Exception:
         return None
 
