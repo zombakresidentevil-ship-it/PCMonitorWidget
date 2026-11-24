@@ -1,10 +1,13 @@
 # AERO PC MONITOR — Aero Glass desktop widget for Windows 10/11
 import ctypes
 import colorsys
+import csv
+import io
 import json
 import os
 import subprocess
 import time
+import threading
 import tkinter as tk
 import winreg
 from pathlib import Path
@@ -44,6 +47,29 @@ def cpu_name():
     except Exception:
         return "Процессор Windows"
 
+
+def gpu_name():
+    """Read the active display adapter name directly from the Windows registry."""
+    path = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as root:
+            for i in range(32):
+                try:
+                    with winreg.OpenKey(root, f"{i:04d}") as key:
+                        for value_name in ("DriverDesc", "HardwareInformation.AdapterString"):
+                            try:
+                                name = str(winreg.QueryValueEx(key, value_name)[0]).strip()
+                                low = name.lower()
+                                if name and not any(x in low for x in ("microsoft basic", "remote display", "virtual")):
+                                    return name
+                            except OSError:
+                                pass
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return "Видеокарта Windows"
+
 def wifi_info():
     try:
         raw = subprocess.check_output(["netsh", "wlan", "show", "interfaces"],
@@ -59,12 +85,25 @@ def wifi_info():
         return "Сеть Windows"
 
 def gpu_load():
+    # typeperf is a native Windows utility; use it off the UI thread.
     try:
-        cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-          "(Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction Stop).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum"]
-        raw = subprocess.check_output(cmd, creationflags=0x08000000,
-            text=True, stderr=subprocess.DEVNULL, timeout=3).strip()
-        return min(100.0, max(0.0, float(raw))) if raw else None
+        raw = subprocess.check_output(
+            ["typeperf", r"\GPU Engine(*)\Utilization Percentage", "-sc", "1"],
+            creationflags=0x08000000, text=True, encoding="utf-8",
+            errors="replace", stderr=subprocess.DEVNULL, timeout=5)
+        rows = list(csv.reader(io.StringIO(raw)))
+        values = []
+        for row in rows[1:]:
+            if len(row) < 2:
+                continue
+            counter = row[0].lower()
+            if "engtype_3d" not in counter:
+                continue
+            try:
+                values.append(float(row[-1].strip().replace(",", ".")))
+            except ValueError:
+                pass
+        return min(100.0, max(values)) if values else None
     except Exception:
         return None
 
@@ -152,13 +191,14 @@ class Widget:
         self.ssid = "Поиск сети…"
         self.ip = "—"
         self.gpu = None
+        self.gpu_name = gpu_name()
         self.cpu_temp = None
         self.gpu_temp = None
         self.last_gpu = 0
         self.last_temp = 0
         self.last_wifi = 0
         self.last_disks = 0
-        self.drives = partitions()
+        self.drives = []
         self.last_net = psutil.net_io_counters()
         self.last_time = time.monotonic()
         self.alpha = DEFAULT_ALPHA
@@ -168,6 +208,7 @@ class Widget:
         self.load_settings()
         psutil.cpu_percent(interval=None)
         self.show_main()
+        self.start_background_worker()
         self.update_data()
         self.root.mainloop()
 
@@ -223,7 +264,9 @@ class Widget:
         self.screen = "main"
         self.clear_screen()
         self.apply_window_alpha()
-        self.root.geometry(f"{W}x{self.main_height()}+120+90")
+        self.root.update_idletasks()
+        x = max(0, self.root.winfo_screenwidth() - W - 18)
+        self.root.geometry(f"{W}x{self.main_height()}+{x}+18")
         self.canvas = tk.Canvas(self.root, width=W, height=self.main_height(),
             bg=self.palette()["bg"], highlightthickness=1,
             highlightbackground=self.palette()["edge"])
@@ -270,7 +313,7 @@ class Widget:
         self.text(326, 12, "–", 14, TEXT, tags="min_btn")
         self.text(350, 12, "×", 14, TEXT, tags="close_btn")
         self.canvas.tag_bind("settings_btn", "<Button-1>", lambda e: self.show_settings())
-        self.canvas.tag_bind("min_btn", "<Button-1>", lambda e: self.root.iconify())
+        self.canvas.tag_bind("min_btn", "<Button-1>", lambda e: self.minimize())
         self.canvas.tag_bind("close_btn", "<Button-1>", lambda e: self.root.destroy())
 
     def draw_bar(self, x, y, w, percent, color, tag=None, height=5):
@@ -291,7 +334,7 @@ class Widget:
         self.draw_bar(22, 137, 148, 0, p["accent"], "cpu_bar")
 
         self.panel(190, 58, 168, 91, "ВИДЕОКАРТА")
-        self.text(200, 78, "GPU • WINDOWS", 8, TEXT, "bold")
+        self.text(200, 78, self.gpu_name[:25], 7, TEXT, "bold", tags="gpu_name")
         self.text(200, 98, "НАГРУЗКА", 6, MUTED)
         self.text(200, 108, "—%", 18, TEXT, "bold", tags="gpu_load")
         self.text(289, 99, "ТЕМПЕРАТУРА", 6, MUTED)
@@ -324,6 +367,7 @@ class Widget:
         self.text(210, net_y+26, "↓ — КБ/с", 8, p["accent"], "bold", tags="net_down")
         self.text(210, net_y+45, "↑ — КБ/с", 8, p["accent2"], "bold", tags="net_up")
         self.root.geometry(f"{W}x{net_y+88}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+        self.root.after(120, self.enable_taskbar_minimize)
 
     def show_settings(self):
         self.saved_alpha, self.saved_hue = self.alpha, self.hue
@@ -418,11 +462,79 @@ class Widget:
     def set_text(self, tag, value):
         self.canvas.itemconfigure(tag, text=value)
 
+
+    def enable_taskbar_minimize(self):
+        # Borderless window + normal taskbar button, so the custom "–" really minimizes.
+        try:
+            hwnd = self.root.winfo_id()
+            user32 = ctypes.windll.user32
+            GWL_EXSTYLE, GWL_STYLE = -20, -16
+            WS_EX_APPWINDOW, WS_EX_TOOLWINDOW = 0x00040000, 0x00000080
+            WS_MINIMIZEBOX, WS_SYSMENU = 0x00020000, 0x00080000
+            exstyle = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                (exstyle | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW)
+            style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+            user32.SetWindowLongW(hwnd, GWL_STYLE, style | WS_MINIMIZEBOX | WS_SYSMENU)
+            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)
+        except Exception:
+            pass
+
+    def minimize(self):
+        try:
+            self.enable_taskbar_minimize()
+            ctypes.windll.user32.ShowWindow(self.root.winfo_id(), 6)  # SW_MINIMIZE
+        except Exception:
+            self.root.withdraw()
+
+    def start_background_worker(self):
+        self.worker_data = {
+            "gpu": None, "cpu_temp": None, "gpu_temp": None,
+            "drives": [], "ssid": "Поиск сети…", "ip": "—"
+        }
+        self.worker_lock = threading.Lock()
+        self.worker_thread = threading.Thread(target=self.background_worker, daemon=True)
+        self.worker_thread.start()
+
+    def background_worker(self):
+        # Slow Windows commands run away from Tk's UI thread to keep startup and animation snappy.
+        next_gpu = next_temp = next_wifi = next_disks = 0.0
+        while True:
+            now = time.monotonic()
+            updates = {}
+            if now >= next_gpu:
+                updates["gpu"] = gpu_load()
+                next_gpu = now + 5
+            if now >= next_temp:
+                ct, gt = temperatures()
+                updates["cpu_temp"], updates["gpu_temp"] = ct, gt
+                next_temp = now + 12
+            if now >= next_wifi:
+                updates["ssid"] = wifi_info()
+                updates["ip"] = next((a.address for vals in psutil.net_if_addrs().values()
+                    for a in vals if a.family == 2 and not a.address.startswith("127.")), "—")
+                next_wifi = now + 20
+            if now >= next_disks:
+                updates["drives"] = partitions()
+                next_disks = now + 20
+            if updates:
+                with self.worker_lock:
+                    self.worker_data.update(updates)
+            time.sleep(0.25)
+
     def update_data(self):
         try:
             now = time.monotonic()
             cpu = psutil.cpu_percent(interval=None)
             used, total = memory()
+            with self.worker_lock:
+                data = dict(self.worker_data)
+            if data["drives"] and len(data["drives"]) != len(self.drives):
+                self.drives = data["drives"]
+                if self.screen == "main":
+                    self.show_main()
+            elif data["drives"]:
+                self.drives = data["drives"]
             if self.screen == "main":
                 self.set_text("cpu_load", f"{cpu:.0f}%")
                 self.set_text("ram_used", f"{used/1024**3:.1f} ГБ")
@@ -432,28 +544,16 @@ class Widget:
                     self.palette()["accent"], "ram_bar", 5)
                 self.canvas.delete("cpu_bar")
                 self.draw_bar(22, 137, 148, cpu, self.palette()["accent"], "cpu_bar")
-                if now-self.last_gpu >= 5:
-                    self.gpu = gpu_load()
-                    self.last_gpu = now
-                self.set_text("gpu_load", f"{self.gpu:.0f}%" if self.gpu is not None else "—%")
+                self.set_text("gpu_load", f"{data['gpu']:.0f}%" if data["gpu"] is not None else "—%")
+                self.set_text("gpu_name", self.gpu_name[:25])
                 self.canvas.delete("gpu_bar")
-                self.draw_bar(200, 137, 148, self.gpu or 0,
+                self.draw_bar(200, 137, 148, data["gpu"] or 0,
                     self.palette()["accent2"], "gpu_bar")
-                if now-self.last_temp >= 8:
-                    self.cpu_temp, self.gpu_temp = temperatures()
-                    self.last_temp = now
-                self.set_text("cpu_temp", f"{self.cpu_temp:.0f}°C" if self.cpu_temp is not None else "н/д")
-                self.set_text("gpu_temp", f"{self.gpu_temp:.0f}°C" if self.gpu_temp is not None else "н/д")
-                if now-self.last_disks >= 10:
-                    self.drives = partitions()
-                    self.last_disks = now
-                if now-self.last_wifi >= 8:
-                    self.ssid = wifi_info()
-                    self.last_wifi = now
-                    self.ip = next((a.address for vals in psutil.net_if_addrs().values()
-                        for a in vals if a.family == 2 and not a.address.startswith("127.")), "—")
-                self.set_text("ssid", self.ssid[:44])
-                self.set_text("ip", "IP: " + self.ip)
+                ct, gt = data["cpu_temp"], data["gpu_temp"]
+                self.set_text("cpu_temp", f"{ct:.0f}°C" if ct is not None else "н/д")
+                self.set_text("gpu_temp", f"{gt:.0f}°C" if gt is not None else "н/д")
+                self.set_text("ssid", data["ssid"][:44])
+                self.set_text("ip", "IP: " + data["ip"])
                 net = psutil.net_io_counters()
                 dt = max(.1, now-self.last_time)
                 down = max(0, net.bytes_recv-self.last_net.bytes_recv)/dt/1024
@@ -463,7 +563,7 @@ class Widget:
                 self.last_net, self.last_time = net, now
         except Exception:
             pass
-        self.root.after(1500, self.update_data)
+        self.root.after(1000, self.update_data)
 
     @staticmethod
     def speed(kb):
