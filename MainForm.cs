@@ -146,7 +146,11 @@ public sealed class MainForm : Form
         foreach (var sub in hw.SubHardware) ReadHardware(sub);
     }
 
-    private static void UpdateHardware(IHardware hw) => hw.Update();
+    private static void UpdateHardware(IHardware hw)
+    {
+        hw.Update();
+        foreach (var sub in hw.SubHardware) UpdateHardware(sub);
+    }
 
     private void ReadMemory()
     {
